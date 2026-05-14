@@ -38,6 +38,9 @@ pub struct CompiledPort {
 pub struct PortState {
     pub name: String,
     pub pty_path: PathBuf,
+    /// Optional stable symlink to `pty_path`. Created on spawn,
+    /// removed on drop.
+    pub symlink: Option<PathBuf>,
     pub master: Mutex<File>,
     pub active: RwLock<Arc<CompiledScenario>>,
     pub compiled: RwLock<Arc<CompiledPort>>,
@@ -49,6 +52,20 @@ pub struct PortState {
     /// serial port would) until external consumers attach.
     #[allow(dead_code)]
     slave_keepalive: OwnedFd,
+}
+
+impl Drop for PortState {
+    fn drop(&mut self) {
+        if let Some(link) = &self.symlink {
+            // Only unlink if it actually points to our PTY — never
+            // delete a user file by accident.
+            if let Ok(target) = std::fs::read_link(link) {
+                if target == self.pty_path {
+                    let _ = std::fs::remove_file(link);
+                }
+            }
+        }
+    }
 }
 
 impl PortState {
@@ -79,9 +96,31 @@ impl PortState {
             .try_clone()
             .map_err(|e| format!("port {}: dup master: {}", cfg.name, e))?;
 
+        // Symlink is a convenience for clients pinning to a stable
+        // device path. Failure (most commonly: macOS devfs refuses
+        // writes under /dev) is logged and the port still starts —
+        // the real PTY at `pty_path` works regardless.
+        let symlink = match &cfg.symlink {
+            None => None,
+            Some(link) => match create_symlink(link, &pty_path) {
+                Ok(()) => Some(link.clone()),
+                Err(e) => {
+                    warn!(
+                        port = %cfg.name,
+                        link = %link.display(),
+                        target = %pty_path.display(),
+                        error = %e,
+                        "could not create symlink; port still usable via PTY path",
+                    );
+                    None
+                }
+            },
+        };
+
         let state = Arc::new(PortState {
             name: cfg.name.clone(),
             pty_path: pty_path.clone(),
+            symlink,
             master: Mutex::new(master_file),
             active: RwLock::new(initial),
             compiled: RwLock::new(compiled),
@@ -200,6 +239,30 @@ pub fn process_line_on<W: Write>(
             Ok((Some(label), Some(resp)))
         }
     }
+}
+
+/// Create a symlink at `link` pointing to `target`. If `link` already
+/// exists and is itself a symlink, replace it (likely a leftover from
+/// a prior run); if it's a real file/dir, refuse to overwrite.
+fn create_symlink(link: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = link.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            std::fs::remove_file(link)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "refusing to overwrite non-symlink at requested path",
+            ));
+        }
+        Err(_) => {}
+    }
+    std::os::unix::fs::symlink(target, link)
 }
 
 fn compile_port(cfg: &PortConfig) -> Result<CompiledPort, String> {
@@ -497,6 +560,7 @@ mod tests {
         crate::config::PortConfig {
             name: "p".into(),
             initial_scenario: "idle".into(),
+            symlink: None,
             capture: Default::default(),
             scenarios: vec![
                 ScenarioConfig {

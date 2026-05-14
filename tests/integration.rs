@@ -59,6 +59,7 @@ impl Service {
 
         let bin = env!("CARGO_BIN_EXE_serial-mock-service");
         let mut child = Command::new(bin)
+            .arg("serve")
             .arg(&cfg_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

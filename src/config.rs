@@ -70,6 +70,13 @@ fn default_bind() -> String {
 pub struct PortConfig {
     pub name: String,
     pub initial_scenario: String,
+    /// Optional stable symlink to the PTY slave. The service creates
+    /// it on spawn and removes it on shutdown. Useful on macOS where
+    /// the kernel-assigned `/dev/ttysNNN` changes every restart and
+    /// is invisible to IOKit-based serial enumeration anyway — a
+    /// stable path here at least lets test scripts pin to one name.
+    #[serde(default)]
+    pub symlink: Option<std::path::PathBuf>,
     #[serde(default)]
     pub capture: CaptureConfig,
     pub scenarios: Vec<ScenarioConfig>,

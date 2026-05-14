@@ -2,12 +2,13 @@ http:
   bind: "127.0.0.1:5000"
 
 logging:
-  level: info       # error | warn | info | debug | trace
-  format: text      # text | json   (override level at runtime with RUST_LOG)
+  level: info # error | warn | info | debug | trace
+  format: text # text | json   (override level at runtime with RUST_LOG)
 
 ports:
   - name: scale-1
     initial_scenario: idle
+    symlink: /tmp/tty.mock-scale-1
     capture:
       max_events: 1000
       max_raw_bytes: 65536
@@ -35,6 +36,7 @@ ports:
 
   - name: scale-2
     initial_scenario: idle
+    symlink: /tmp/tty.mock-scale-2
     scenarios:
       - name: idle
         triggers:

@@ -1,13 +1,17 @@
-// Entry point: parse args, load YAML, spawn PTYs + reader threads,
-// install SIGHUP handler, run HTTP server on the main thread.
+// Entry point.
+//
+// Dispatches between `serve` (long-running daemon) and the various
+// client subcommands defined in `cli::Cmd`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use clap::Parser;
 use tracing::{error, info};
 
 mod capture;
+mod cli;
 mod config;
 mod http;
 mod logging;
@@ -16,22 +20,20 @@ mod port;
 mod reload;
 mod server;
 
+use crate::cli::{Cli, Cmd};
 use crate::port::PortState;
 use crate::server::Server;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 2 || args[1] == "-h" || args[1] == "--help" {
-        // Pre-logger: the user is invoking us wrong; write to stderr
-        // directly so the message lands no matter what.
-        eprintln!(
-            "usage: {} <config.yaml>",
-            args.first().map(String::as_str).unwrap_or("serial-mock-service")
-        );
-        return ExitCode::from(2);
-    }
+    let parsed = Cli::parse();
 
-    let config_path = PathBuf::from(&args[1]);
+    match parsed.command {
+        Cmd::Serve { config } => serve(config),
+        other => ExitCode::from(cli::run(other) as u8),
+    }
+}
+
+fn serve(config_path: PathBuf) -> ExitCode {
     let cfg = match config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
