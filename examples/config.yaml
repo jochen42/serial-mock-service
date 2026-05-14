@@ -1,0 +1,38 @@
+http:
+  bind: "127.0.0.1:5000"
+
+ports:
+  - name: scale-1
+    initial_scenario: idle
+    capture:
+      max_events: 1000
+      max_raw_bytes: 65536
+    scenarios:
+      - name: idle
+        triggers:
+          - name: print
+            response: "S S  15.00 kg\r\n"
+          - name: print_heavy
+            response: "S S 123.45 kg\r\n"
+          - name: tare_ok
+            response: "T OK\r\n"
+        input_rules:
+          - match: { exact: "Q\r\n" }
+            response: "S S  12.50 kg\r\n"
+          - match: { regex: "^GET .*\r?\n$" }
+            response: "OK\r\n"
+      - name: error
+        triggers:
+          - name: print
+            response: "ERR\r\n"
+        input_rules:
+          - match: { exact: "Q\r\n" }
+            response: "ERR\r\n"
+
+  - name: scale-2
+    initial_scenario: idle
+    scenarios:
+      - name: idle
+        triggers:
+          - name: ping
+            response: "PONG\r\n"

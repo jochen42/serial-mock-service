@@ -1,0 +1,531 @@
+// Per-port state and the reader thread.
+//
+// One `PortState` per PTY. The reader thread blocks on `read()` from
+// the master fd, capturing every byte and (once a `\n`-terminated line
+// is complete) walking the active scenario's input rules. The HTTP
+// layer pokes the same `PortState` to fire triggers and switch
+// scenarios.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+
+use nix::pty::openpty;
+use nix::unistd::ttyname;
+
+use crate::capture::Capture;
+use crate::config::{PortConfig, ScenarioConfig};
+use crate::matching::{compile_rules, CompiledRule};
+
+/// Pre-compiled, ready-to-execute view of a scenario.
+pub struct CompiledScenario {
+    pub name: String,
+    pub triggers: HashMap<String, Vec<u8>>,
+    pub input_rules: Vec<CompiledRule>,
+}
+
+/// Pre-compiled view of an entire port config.
+pub struct CompiledPort {
+    pub scenarios: HashMap<String, Arc<CompiledScenario>>,
+    pub scenario_order: Vec<String>,
+}
+
+pub struct PortState {
+    pub name: String,
+    pub pty_path: PathBuf,
+    pub master: Mutex<File>,
+    pub active: RwLock<Arc<CompiledScenario>>,
+    pub compiled: RwLock<Arc<CompiledPort>>,
+    pub capture: Mutex<Capture>,
+    /// Held only to keep the slave end open inside the kernel — on
+    /// macOS the master `read()` returns EIO/EOF whenever the slave
+    /// has no open file descriptors anywhere in the system. Keeping
+    /// our own dummy reference makes the master block (as a real
+    /// serial port would) until external consumers attach.
+    #[allow(dead_code)]
+    slave_keepalive: OwnedFd,
+}
+
+impl PortState {
+    /// Open a PTY, compile config, spin up the reader thread, return
+    /// the shared state.
+    pub fn spawn(cfg: &PortConfig) -> Result<Arc<Self>, String> {
+        let compiled = Arc::new(compile_port(cfg)?);
+        let initial = compiled
+            .scenarios
+            .get(&cfg.initial_scenario)
+            .cloned()
+            .ok_or_else(|| format!("port {}: initial scenario missing", cfg.name))?;
+
+        let pty = openpty(None, None)
+            .map_err(|e| format!("port {}: openpty: {}", cfg.name, e))?;
+
+        let pty_path = ttyname(&pty.slave)
+            .map_err(|e| format!("port {}: ttyname: {}", cfg.name, e))?;
+
+        let slave_keepalive = pty.slave;
+
+        let master_fd = pty.master.into_raw_fd();
+        let master_file = unsafe { File::from_raw_fd(master_fd) };
+
+        // Reader thread needs an independent File handle so it can
+        // read while triggers hold the write mutex.
+        let reader_file = master_file
+            .try_clone()
+            .map_err(|e| format!("port {}: dup master: {}", cfg.name, e))?;
+
+        let state = Arc::new(PortState {
+            name: cfg.name.clone(),
+            pty_path: pty_path.clone(),
+            master: Mutex::new(master_file),
+            active: RwLock::new(initial),
+            compiled: RwLock::new(compiled),
+            capture: Mutex::new(Capture::new(
+                cfg.capture.max_raw_bytes,
+                cfg.capture.max_events,
+            )),
+            slave_keepalive,
+        });
+
+        spawn_reader(state.clone(), reader_file);
+
+        Ok(state)
+    }
+
+    /// Replace the compiled config for this port (used by reload).
+    /// Best-effort: if the previously-active scenario no longer exists,
+    /// fall back to the new initial scenario.
+    pub fn swap_config(&self, cfg: &PortConfig) -> Result<(), String> {
+        let compiled = Arc::new(compile_port(cfg)?);
+        let new_active = {
+            let current_name = self.active.read().unwrap().name.clone();
+            compiled
+                .scenarios
+                .get(&current_name)
+                .cloned()
+                .or_else(|| compiled.scenarios.get(&cfg.initial_scenario).cloned())
+                .ok_or_else(|| format!("port {}: no usable scenario after reload", cfg.name))?
+        };
+        *self.compiled.write().unwrap() = compiled;
+        *self.active.write().unwrap() = new_active;
+        Ok(())
+    }
+
+    /// Switch active scenario by name. Returns Err if unknown.
+    pub fn switch_scenario(&self, name: &str) -> Result<(), String> {
+        let next = self
+            .compiled
+            .read()
+            .unwrap()
+            .scenarios
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown scenario: {}", name))?;
+        *self.active.write().unwrap() = next;
+        Ok(())
+    }
+
+    /// Fire a named trigger on the active scenario. Thin wrapper that
+    /// locks the master and delegates to [`fire_trigger_on`] so the
+    /// logic can be unit-tested against an arbitrary `Write` sink.
+    pub fn fire_trigger(&self, name: &str) -> Result<Vec<u8>, String> {
+        let scenario = self.active.read().unwrap().clone();
+        let mut master = self.master.lock().unwrap();
+        fire_trigger_on(&scenario, name, &mut *master)
+    }
+}
+
+/// Look up a trigger by name on the given scenario. Pure helper.
+pub fn lookup_trigger<'a>(scenario: &'a CompiledScenario, name: &str) -> Option<&'a [u8]> {
+    scenario.triggers.get(name).map(Vec::as_slice)
+}
+
+/// Walk input rules in order; return `(rule_index, response)` of the
+/// first match, or None. Pure helper.
+pub fn match_input_rule<'a>(
+    scenario: &'a CompiledScenario,
+    line: &[u8],
+) -> Option<(usize, &'a [u8])> {
+    for (idx, rule) in scenario.input_rules.iter().enumerate() {
+        if rule.matcher.matches(line) {
+            return Some((idx, &rule.response));
+        }
+    }
+    None
+}
+
+/// Trigger-fire core: look up by name, write to `sink`, return bytes.
+/// The `sink` parameter is the London-style seam — tests pass a
+/// `Vec<u8>` spy; production passes the locked PTY master `File`.
+pub fn fire_trigger_on<W: Write>(
+    scenario: &CompiledScenario,
+    name: &str,
+    sink: &mut W,
+) -> Result<Vec<u8>, String> {
+    let response = lookup_trigger(scenario, name)
+        .ok_or_else(|| format!("unknown trigger: {}", name))?
+        .to_vec();
+    sink.write_all(&response)
+        .map_err(|e| format!("write master: {}", e))?;
+    let _ = sink.flush();
+    Ok(response)
+}
+
+/// Line-processing core: match against rules, write response (if any)
+/// to `sink`. Returns the matched rule label (e.g. `"idle:0"`) and the
+/// response bytes that were emitted, for the caller to push to capture.
+pub fn process_line_on<W: Write>(
+    scenario: &CompiledScenario,
+    line: &[u8],
+    sink: &mut W,
+) -> (Option<String>, Option<Vec<u8>>) {
+    match match_input_rule(scenario, line) {
+        None => (None, None),
+        Some((idx, response)) => {
+            let resp = response.to_vec();
+            if sink.write_all(&resp).is_ok() {
+                let _ = sink.flush();
+            }
+            (Some(format!("{}:{}", scenario.name, idx)), Some(resp))
+        }
+    }
+}
+
+fn compile_port(cfg: &PortConfig) -> Result<CompiledPort, String> {
+    let mut scenarios = HashMap::new();
+    let mut order = Vec::with_capacity(cfg.scenarios.len());
+    for sc in &cfg.scenarios {
+        scenarios.insert(sc.name.clone(), Arc::new(compile_scenario(sc)?));
+        order.push(sc.name.clone());
+    }
+    Ok(CompiledPort {
+        scenarios,
+        scenario_order: order,
+    })
+}
+
+fn compile_scenario(sc: &ScenarioConfig) -> Result<CompiledScenario, String> {
+    let triggers = sc
+        .triggers
+        .iter()
+        .map(|t| (t.name.clone(), t.response.as_bytes().to_vec()))
+        .collect();
+    let input_rules = compile_rules(&sc.input_rules)
+        .map_err(|e| format!("scenario {}: {}", sc.name, e))?;
+    Ok(CompiledScenario {
+        name: sc.name.clone(),
+        triggers,
+        input_rules,
+    })
+}
+
+fn spawn_reader(state: Arc<PortState>, mut reader: File) {
+    let thread_name = format!("port-reader:{}", state.name);
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || reader_loop(state, &mut reader))
+        .expect("spawn reader thread");
+}
+
+const MAX_LINE_BYTES: usize = 4096;
+
+fn reader_loop(state: Arc<PortState>, reader: &mut File) {
+    let mut buf = [0u8; 1024];
+    let mut line = Vec::with_capacity(256);
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => {
+                eprintln!("port {}: EOF on master, reader exiting", state.name);
+                return;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("port {}: read error: {} — reader exiting", state.name, e);
+                return;
+            }
+        };
+        let chunk = &buf[..n];
+
+        // Always capture the raw bytes first.
+        {
+            let mut cap = state.capture.lock().unwrap();
+            cap.append_raw(chunk);
+        }
+
+        // Line-buffered matching: feed bytes into `line`, on each `\n`
+        // run rules against the completed line (terminator included).
+        for &b in chunk {
+            if line.len() >= MAX_LINE_BYTES {
+                // Pathological input with no newline — flush as an
+                // unmatched event so the buffer cannot grow forever.
+                let bytes = std::mem::take(&mut line);
+                state.capture.lock().unwrap().push_event(bytes, None);
+            }
+            line.push(b);
+            if b == b'\n' {
+                let bytes = std::mem::take(&mut line);
+                handle_line(&state, bytes);
+            }
+        }
+    }
+}
+
+fn handle_line(state: &Arc<PortState>, bytes: Vec<u8>) {
+    let scenario = state.active.read().unwrap().clone();
+    let (matched_rule, _response) = {
+        let mut master = state.master.lock().unwrap();
+        process_line_on(&scenario, &bytes, &mut *master)
+    };
+    state.capture.lock().unwrap().push_event(bytes, matched_rule);
+}
+
+#[cfg(test)]
+mod tests {
+    //! London-style unit tests: the trigger/match logic talks to a
+    //! `Write` collaborator. Tests substitute a `Vec<u8>` spy and
+    //! assert on the **bytes the collaborator was asked to write**
+    //! (interaction verification), not on internal state.
+    //!
+    //! `WriteSpy` is a hand-rolled mock that also records call counts
+    //! and can be configured to fail, so we can verify both happy and
+    //! sad paths.
+
+    use super::*;
+    use crate::config::{InputRuleConfig, MatchConfig, ScenarioConfig, TriggerConfig};
+    use std::io;
+
+    /// Manual mock implementing `Write`. Captures every byte plus call
+    /// counts; optionally fails the next `write_all` to exercise error
+    /// paths.
+    struct WriteSpy {
+        pub bytes: Vec<u8>,
+        pub write_calls: usize,
+        pub flush_calls: usize,
+        pub fail_next_write: bool,
+    }
+
+    impl WriteSpy {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                write_calls: 0,
+                flush_calls: 0,
+                fail_next_write: false,
+            }
+        }
+    }
+
+    impl io::Write for WriteSpy {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_calls += 1;
+            if self.fail_next_write {
+                self.fail_next_write = false;
+                return Err(io::Error::new(io::ErrorKind::Other, "spy: forced fail"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn make_scenario() -> CompiledScenario {
+        let cfg = ScenarioConfig {
+            name: "idle".into(),
+            triggers: vec![
+                TriggerConfig { name: "print".into(), response: "S S  15.00 kg\r\n".into() },
+                TriggerConfig { name: "tare".into(), response: "T OK\r\n".into() },
+            ],
+            input_rules: vec![
+                InputRuleConfig {
+                    match_: MatchConfig { exact: Some("Q\r\n".into()), regex: None },
+                    response: "S S  12.50 kg\r\n".into(),
+                },
+                InputRuleConfig {
+                    match_: MatchConfig { exact: None, regex: Some(r"^GET .*\r?\n$".into()) },
+                    response: "OK\r\n".into(),
+                },
+            ],
+        };
+        compile_scenario(&cfg).unwrap()
+    }
+
+    // ---- lookup_trigger / match_input_rule: pure-helper sanity ----
+
+    #[test]
+    fn lookup_trigger_returns_bytes_when_present() {
+        let sc = make_scenario();
+        assert_eq!(lookup_trigger(&sc, "print").unwrap(), b"S S  15.00 kg\r\n");
+        assert_eq!(lookup_trigger(&sc, "tare").unwrap(), b"T OK\r\n");
+    }
+
+    #[test]
+    fn lookup_trigger_none_when_unknown() {
+        let sc = make_scenario();
+        assert!(lookup_trigger(&sc, "nope").is_none());
+    }
+
+    #[test]
+    fn match_input_rule_returns_first_match_index() {
+        let sc = make_scenario();
+        let (idx, resp) = match_input_rule(&sc, b"Q\r\n").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(resp, b"S S  12.50 kg\r\n");
+    }
+
+    #[test]
+    fn match_input_rule_falls_through_to_regex() {
+        let sc = make_scenario();
+        let (idx, resp) = match_input_rule(&sc, b"GET ping\r\n").unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(resp, b"OK\r\n");
+    }
+
+    #[test]
+    fn match_input_rule_none_on_no_match() {
+        let sc = make_scenario();
+        assert!(match_input_rule(&sc, b"BOGUS\r\n").is_none());
+    }
+
+    // ---- fire_trigger_on: mockist interaction tests ----
+
+    #[test]
+    fn fire_trigger_writes_exact_bytes_to_collaborator() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        let bytes = fire_trigger_on(&sc, "print", &mut spy).unwrap();
+
+        // Behavior we care about: collaborator got the right bytes,
+        // exactly once.
+        assert_eq!(spy.bytes, b"S S  15.00 kg\r\n");
+        assert_eq!(spy.write_calls, 1);
+        assert_eq!(bytes, b"S S  15.00 kg\r\n");
+        assert!(spy.flush_calls >= 1, "expected flush after write");
+    }
+
+    #[test]
+    fn fire_trigger_does_not_touch_collaborator_when_trigger_unknown() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        let err = fire_trigger_on(&sc, "nope", &mut spy).unwrap_err();
+        assert!(err.contains("unknown trigger"));
+        assert_eq!(spy.write_calls, 0, "no write should have been issued");
+        assert!(spy.bytes.is_empty());
+    }
+
+    #[test]
+    fn fire_trigger_surfaces_collaborator_write_failure() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        spy.fail_next_write = true;
+        let err = fire_trigger_on(&sc, "print", &mut spy).unwrap_err();
+        assert!(err.contains("write master"), "{}", err);
+        // Spy was invoked; that's the interaction we wanted to verify.
+        assert_eq!(spy.write_calls, 1);
+    }
+
+    // ---- process_line_on: mockist interaction tests ----
+
+    #[test]
+    fn process_line_writes_response_for_exact_match() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        let (label, resp) = process_line_on(&sc, b"Q\r\n", &mut spy);
+        assert_eq!(label.as_deref(), Some("idle:0"));
+        assert_eq!(resp.as_deref(), Some(b"S S  12.50 kg\r\n".as_slice()));
+        assert_eq!(spy.bytes, b"S S  12.50 kg\r\n");
+        assert_eq!(spy.write_calls, 1);
+    }
+
+    #[test]
+    fn process_line_writes_response_for_regex_match() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        let (label, _) = process_line_on(&sc, b"GET ping\r\n", &mut spy);
+        assert_eq!(label.as_deref(), Some("idle:1"));
+        assert_eq!(spy.bytes, b"OK\r\n");
+    }
+
+    #[test]
+    fn process_line_silent_when_no_rule_matches() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        let (label, resp) = process_line_on(&sc, b"BOGUS\r\n", &mut spy);
+        assert!(label.is_none());
+        assert!(resp.is_none());
+        assert_eq!(spy.write_calls, 0, "collaborator must not be called");
+        assert!(spy.bytes.is_empty());
+    }
+
+    // ---- PortState wiring: end-to-end with the real File seam ----
+
+    fn test_port_cfg() -> crate::config::PortConfig {
+        crate::config::PortConfig {
+            name: "p".into(),
+            initial_scenario: "idle".into(),
+            capture: Default::default(),
+            scenarios: vec![
+                ScenarioConfig {
+                    name: "idle".into(),
+                    triggers: vec![TriggerConfig {
+                        name: "print".into(),
+                        response: "AAA\r\n".into(),
+                    }],
+                    input_rules: vec![],
+                },
+                ScenarioConfig {
+                    name: "error".into(),
+                    triggers: vec![TriggerConfig {
+                        name: "print".into(),
+                        response: "ERR\r\n".into(),
+                    }],
+                    input_rules: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn switch_scenario_changes_active_arc() {
+        let state = PortState::spawn(&test_port_cfg()).unwrap();
+        assert_eq!(state.active.read().unwrap().name, "idle");
+        state.switch_scenario("error").unwrap();
+        assert_eq!(state.active.read().unwrap().name, "error");
+    }
+
+    #[test]
+    fn switch_scenario_rejects_unknown() {
+        let state = PortState::spawn(&test_port_cfg()).unwrap();
+        let err = state.switch_scenario("ghost").unwrap_err();
+        assert!(err.contains("unknown scenario"));
+        assert_eq!(state.active.read().unwrap().name, "idle");
+    }
+
+    #[test]
+    fn swap_config_preserves_active_when_present() {
+        let state = PortState::spawn(&test_port_cfg()).unwrap();
+        state.switch_scenario("error").unwrap();
+        // Reload with same scenario set — active should stay `error`.
+        state.swap_config(&test_port_cfg()).unwrap();
+        assert_eq!(state.active.read().unwrap().name, "error");
+    }
+
+    #[test]
+    fn swap_config_falls_back_to_initial_when_active_disappears() {
+        let state = PortState::spawn(&test_port_cfg()).unwrap();
+        state.switch_scenario("error").unwrap();
+
+        // New config drops the `error` scenario.
+        let mut new_cfg = test_port_cfg();
+        new_cfg.scenarios.retain(|s| s.name != "error");
+        state.swap_config(&new_cfg).unwrap();
+
+        assert_eq!(state.active.read().unwrap().name, "idle");
+    }
+}
