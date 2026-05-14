@@ -14,7 +14,40 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub http: HttpConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     pub ports: Vec<PortConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoggingConfig {
+    /// Same syntax as `RUST_LOG`. Examples: `info`, `debug`,
+    /// `serial_mock_service=debug,warn`.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+fn default_log_level() -> String {
+    "info".into()
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -9,6 +9,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
+use tracing::{debug, info, warn};
+
 use crate::port::PortState;
 use crate::server::Server;
 
@@ -17,18 +19,18 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub fn serve(bind: &str, server: Arc<Server>) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind)?;
-    println!("HTTP API listening on http://{}", bind);
+    info!(bind = %bind, "HTTP API listening on http://{}", bind);
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
                 let server = server.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle(stream, server) {
-                        eprintln!("http error: {}", e);
+                        debug!(error = %e, "request handling error");
                     }
                 });
             }
-            Err(e) => eprintln!("accept error: {}", e),
+            Err(e) => warn!(error = %e, "accept error"),
         }
     }
     Ok(())

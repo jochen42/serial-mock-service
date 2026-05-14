@@ -16,6 +16,7 @@ use std::thread;
 
 use nix::pty::openpty;
 use nix::unistd::ttyname;
+use tracing::{info, warn};
 
 use crate::capture::Capture;
 use crate::config::{PortConfig, ScenarioConfig};
@@ -178,19 +179,25 @@ pub fn fire_trigger_on<W: Write>(
 /// Line-processing core: match against rules, write response (if any)
 /// to `sink`. Returns the matched rule label (e.g. `"idle:0"`) and the
 /// response bytes that were emitted, for the caller to push to capture.
+///
+/// Write failures are surfaced via `Err`; matched-rule label is still
+/// returned alongside so the caller can choose to log + still record
+/// the capture event.
 pub fn process_line_on<W: Write>(
     scenario: &CompiledScenario,
     line: &[u8],
     sink: &mut W,
-) -> (Option<String>, Option<Vec<u8>>) {
+) -> Result<(Option<String>, Option<Vec<u8>>), (String, std::io::Error)> {
     match match_input_rule(scenario, line) {
-        None => (None, None),
+        None => Ok((None, None)),
         Some((idx, response)) => {
             let resp = response.to_vec();
-            if sink.write_all(&resp).is_ok() {
-                let _ = sink.flush();
+            let label = format!("{}:{}", scenario.name, idx);
+            if let Err(e) = sink.write_all(&resp) {
+                return Err((label, e));
             }
-            (Some(format!("{}:{}", scenario.name, idx)), Some(resp))
+            let _ = sink.flush();
+            Ok((Some(label), Some(resp)))
         }
     }
 }
@@ -239,12 +246,12 @@ fn reader_loop(state: Arc<PortState>, reader: &mut File) {
     loop {
         let n = match reader.read(&mut buf) {
             Ok(0) => {
-                eprintln!("port {}: EOF on master, reader exiting", state.name);
+                info!(port = %state.name, "EOF on master, reader exiting");
                 return;
             }
             Ok(n) => n,
             Err(e) => {
-                eprintln!("port {}: read error: {} — reader exiting", state.name, e);
+                warn!(port = %state.name, error = %e, "read error, reader exiting");
                 return;
             }
         };
@@ -276,9 +283,20 @@ fn reader_loop(state: Arc<PortState>, reader: &mut File) {
 
 fn handle_line(state: &Arc<PortState>, bytes: Vec<u8>) {
     let scenario = state.active.read().unwrap().clone();
-    let (matched_rule, _response) = {
+    let matched_rule = {
         let mut master = state.master.lock().unwrap();
-        process_line_on(&scenario, &bytes, &mut *master)
+        match process_line_on(&scenario, &bytes, &mut *master) {
+            Ok((label, _resp)) => label,
+            Err((label, err)) => {
+                warn!(
+                    port = %state.name,
+                    rule = %label,
+                    error = %err,
+                    "input-rule write to master failed",
+                );
+                Some(label)
+            }
+        }
     };
     state.capture.lock().unwrap().push_event(bytes, matched_rule);
 }
@@ -436,7 +454,7 @@ mod tests {
     fn process_line_writes_response_for_exact_match() {
         let sc = make_scenario();
         let mut spy = WriteSpy::new();
-        let (label, resp) = process_line_on(&sc, b"Q\r\n", &mut spy);
+        let (label, resp) = process_line_on(&sc, b"Q\r\n", &mut spy).unwrap();
         assert_eq!(label.as_deref(), Some("idle:0"));
         assert_eq!(resp.as_deref(), Some(b"S S  12.50 kg\r\n".as_slice()));
         assert_eq!(spy.bytes, b"S S  12.50 kg\r\n");
@@ -447,7 +465,7 @@ mod tests {
     fn process_line_writes_response_for_regex_match() {
         let sc = make_scenario();
         let mut spy = WriteSpy::new();
-        let (label, _) = process_line_on(&sc, b"GET ping\r\n", &mut spy);
+        let (label, _) = process_line_on(&sc, b"GET ping\r\n", &mut spy).unwrap();
         assert_eq!(label.as_deref(), Some("idle:1"));
         assert_eq!(spy.bytes, b"OK\r\n");
     }
@@ -456,11 +474,21 @@ mod tests {
     fn process_line_silent_when_no_rule_matches() {
         let sc = make_scenario();
         let mut spy = WriteSpy::new();
-        let (label, resp) = process_line_on(&sc, b"BOGUS\r\n", &mut spy);
+        let (label, resp) = process_line_on(&sc, b"BOGUS\r\n", &mut spy).unwrap();
         assert!(label.is_none());
         assert!(resp.is_none());
         assert_eq!(spy.write_calls, 0, "collaborator must not be called");
         assert!(spy.bytes.is_empty());
+    }
+
+    #[test]
+    fn process_line_surfaces_write_error_with_rule_label() {
+        let sc = make_scenario();
+        let mut spy = WriteSpy::new();
+        spy.fail_next_write = true;
+        let err = process_line_on(&sc, b"Q\r\n", &mut spy).unwrap_err();
+        assert_eq!(err.0, "idle:0", "label preserved so caller can still record event");
+        assert_eq!(spy.write_calls, 1);
     }
 
     // ---- PortState wiring: end-to-end with the real File seam ----

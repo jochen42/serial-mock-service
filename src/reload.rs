@@ -15,6 +15,7 @@ use std::thread;
 
 use signal_hook::consts::SIGHUP;
 use signal_hook::iterator::Signals;
+use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
 use crate::port::PortState;
@@ -26,10 +27,10 @@ pub fn install(config_path: PathBuf, server: Arc<Server>) -> std::io::Result<()>
         .name("sighup-reload".into())
         .spawn(move || {
             for _ in signals.forever() {
-                println!("SIGHUP: reloading {}", config_path.display());
+                info!(config = %config_path.display(), "SIGHUP received, reloading");
                 match config::load(&config_path) {
                     Ok(new_cfg) => apply(&server, new_cfg),
-                    Err(e) => eprintln!("reload aborted: {}", e),
+                    Err(e) => error!(error = %e, "reload aborted, keeping previous config"),
                 }
             }
         })?;
@@ -43,22 +44,21 @@ fn apply(server: &Arc<Server>, new_cfg: Config) {
     // Update or spawn each port in the new config.
     for port_cfg in &new_cfg.ports {
         if let Some(state) = server.ports.get(&port_cfg.name) {
-            if let Err(e) = state.swap_config(port_cfg) {
-                eprintln!("port {}: reload swap failed: {}", port_cfg.name, e);
-            } else {
-                println!("port {}: config reloaded", port_cfg.name);
+            match state.swap_config(port_cfg) {
+                Err(e) => warn!(port = %port_cfg.name, error = %e, "reload swap failed"),
+                Ok(()) => info!(port = %port_cfg.name, "config reloaded"),
             }
         } else {
             match PortState::spawn(port_cfg) {
                 Ok(state) => {
-                    println!(
-                        "port {}: spawned (slave: {})",
-                        state.name,
-                        state.pty_path.display()
+                    info!(
+                        port = %state.name,
+                        slave = %state.pty_path.display(),
+                        "port spawned on reload",
                     );
                     server.ports.insert(state);
                 }
-                Err(e) => eprintln!("port {}: spawn on reload failed: {}", port_cfg.name, e),
+                Err(e) => error!(port = %port_cfg.name, error = %e, "spawn on reload failed"),
             }
         }
     }
@@ -67,7 +67,7 @@ fn apply(server: &Arc<Server>, new_cfg: Config) {
     for name in existing {
         if !new_names.iter().any(|n| n == &name) {
             if let Some(_state) = server.ports.remove(&name) {
-                println!("port {}: removed", name);
+                info!(port = %name, "port removed");
                 // Dropping `_state` here closes the master File once
                 // all Arcs go out of scope; reader thread exits on EIO.
             }

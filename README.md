@@ -34,6 +34,10 @@ See [`examples/config.yaml`](examples/config.yaml).
 http:
   bind: "127.0.0.1:5000"
 
+logging:
+  level: info       # error | warn | info | debug | trace
+  format: text      # text | json
+
 ports:
   - name: scale-1
     initial_scenario: idle
@@ -61,6 +65,16 @@ ports:
 - YAML double-quoted strings carry `\r\n` natively. No double-escaping.
 
 Validation runs at load and on every SIGHUP — duplicate names, unknown `initial_scenario`, malformed regex all abort the (re)load without disturbing running ports.
+
+### Logging
+
+`logging.format: text` (default) is human-friendly with colors and aligned fields. `logging.format: json` emits one JSON object per line — suitable for shipping to Loki, Elasticsearch, or anything that ingests structured logs.
+
+The `logging.level` value uses the same syntax as `RUST_LOG` (see [`tracing_subscriber::EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)): plain levels (`info`, `debug`) or per-module overrides (`serial_mock_service=debug,warn`). Set the `RUST_LOG` environment variable to override the YAML at runtime without editing config.
+
+```sh
+RUST_LOG=debug ./serial-mock-service config.yaml
+```
 
 ## HTTP API
 
