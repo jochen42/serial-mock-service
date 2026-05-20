@@ -16,14 +16,14 @@ ports:
       - name: idle
         triggers:
           - name: print
-            response: "S S  15.00 kg\r\n"
+            response: "N:                S S      0.079 kg\r\nT:                         0.000 kg\r\nG:                         0.079 kg\r\n"
           - name: print_heavy
-            response: "S S 123.45 kg\r\n"
+            response: "N:                S S    123.450 kg\r\nT:                         0.000 kg\r\nG:                       123.450 kg\r\n"
           - name: tare_ok
-            response: "T OK\r\n"
+            response: "T:                         0.079 kg\r\n"
         input_rules:
           - match: { exact: "Q\r\n" }
-            response: "S S  12.50 kg\r\n"
+            response: "N:                S S      0.079 kg\r\nT:                         0.000 kg\r\nG:                         0.079 kg\r\n"
           - match: { regex: "^GET .*\r?\n$" }
             response: "OK\r\n"
       - name: error
