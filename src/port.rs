@@ -79,11 +79,10 @@ impl PortState {
             .cloned()
             .ok_or_else(|| format!("port {}: initial scenario missing", cfg.name))?;
 
-        let pty = openpty(None, None)
-            .map_err(|e| format!("port {}: openpty: {}", cfg.name, e))?;
+        let pty = openpty(None, None).map_err(|e| format!("port {}: openpty: {}", cfg.name, e))?;
 
-        let pty_path = ttyname(&pty.slave)
-            .map_err(|e| format!("port {}: ttyname: {}", cfg.name, e))?;
+        let pty_path =
+            ttyname(&pty.slave).map_err(|e| format!("port {}: ttyname: {}", cfg.name, e))?;
 
         let slave_keepalive = pty.slave;
 
@@ -215,6 +214,10 @@ pub fn fire_trigger_on<W: Write>(
     Ok(response)
 }
 
+/// Matched-rule label (`"<scenario>:<idx>"`) plus the response bytes
+/// emitted, both optional when no rule matched.
+pub type LineOutcome = (Option<String>, Option<Vec<u8>>);
+
 /// Line-processing core: match against rules, write response (if any)
 /// to `sink`. Returns the matched rule label (e.g. `"idle:0"`) and the
 /// response bytes that were emitted, for the caller to push to capture.
@@ -226,7 +229,7 @@ pub fn process_line_on<W: Write>(
     scenario: &CompiledScenario,
     line: &[u8],
     sink: &mut W,
-) -> Result<(Option<String>, Option<Vec<u8>>), (String, std::io::Error)> {
+) -> Result<LineOutcome, (String, std::io::Error)> {
     match match_input_rule(scenario, line) {
         None => Ok((None, None)),
         Some((idx, response)) => {
@@ -284,8 +287,8 @@ fn compile_scenario(sc: &ScenarioConfig) -> Result<CompiledScenario, String> {
         .iter()
         .map(|t| (t.name.clone(), t.response.as_bytes().to_vec()))
         .collect();
-    let input_rules = compile_rules(&sc.input_rules)
-        .map_err(|e| format!("scenario {}: {}", sc.name, e))?;
+    let input_rules =
+        compile_rules(&sc.input_rules).map_err(|e| format!("scenario {}: {}", sc.name, e))?;
     Ok(CompiledScenario {
         name: sc.name.clone(),
         triggers,
@@ -361,7 +364,11 @@ fn handle_line(state: &Arc<PortState>, bytes: Vec<u8>) {
             }
         }
     };
-    state.capture.lock().unwrap().push_event(bytes, matched_rule);
+    state
+        .capture
+        .lock()
+        .unwrap()
+        .push_event(bytes, matched_rule);
 }
 
 #[cfg(test)]
@@ -405,7 +412,7 @@ mod tests {
             self.write_calls += 1;
             if self.fail_next_write {
                 self.fail_next_write = false;
-                return Err(io::Error::new(io::ErrorKind::Other, "spy: forced fail"));
+                return Err(io::Error::other("spy: forced fail"));
             }
             self.bytes.extend_from_slice(buf);
             Ok(buf.len())
@@ -420,16 +427,28 @@ mod tests {
         let cfg = ScenarioConfig {
             name: "idle".into(),
             triggers: vec![
-                TriggerConfig { name: "print".into(), response: "S S  15.00 kg\r\n".into() },
-                TriggerConfig { name: "tare".into(), response: "T OK\r\n".into() },
+                TriggerConfig {
+                    name: "print".into(),
+                    response: "S S  15.00 kg\r\n".into(),
+                },
+                TriggerConfig {
+                    name: "tare".into(),
+                    response: "T OK\r\n".into(),
+                },
             ],
             input_rules: vec![
                 InputRuleConfig {
-                    match_: MatchConfig { exact: Some("Q\r\n".into()), regex: None },
+                    match_: MatchConfig {
+                        exact: Some("Q\r\n".into()),
+                        regex: None,
+                    },
                     response: "S S  12.50 kg\r\n".into(),
                 },
                 InputRuleConfig {
-                    match_: MatchConfig { exact: None, regex: Some(r"^GET .*\r?\n$".into()) },
+                    match_: MatchConfig {
+                        exact: None,
+                        regex: Some(r"^GET .*\r?\n$".into()),
+                    },
                     response: "OK\r\n".into(),
                 },
             ],
@@ -550,7 +569,10 @@ mod tests {
         let mut spy = WriteSpy::new();
         spy.fail_next_write = true;
         let err = process_line_on(&sc, b"Q\r\n", &mut spy).unwrap_err();
-        assert_eq!(err.0, "idle:0", "label preserved so caller can still record event");
+        assert_eq!(
+            err.0, "idle:0",
+            "label preserved so caller can still record event"
+        );
         assert_eq!(spy.write_calls, 1);
     }
 

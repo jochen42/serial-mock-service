@@ -150,15 +150,30 @@ pub fn run(cmd: Cmd) -> i32 {
     let result = match cmd {
         Cmd::Serve { .. } => unreachable!("serve handled in main"),
         Cmd::Ports { addr, port } => cmd_ports(&addr, port.as_deref()),
-        Cmd::Scenario { port, scenario, addr } => cmd_scenario(&addr, &port, &scenario),
-        Cmd::Trigger { port, trigger, addr } => cmd_trigger(&addr, &port, &trigger),
+        Cmd::Scenario {
+            port,
+            scenario,
+            addr,
+        } => cmd_scenario(&addr, &port, &scenario),
+        Cmd::Trigger {
+            port,
+            trigger,
+            addr,
+        } => cmd_trigger(&addr, &port, &trigger),
         Cmd::Capture { kind } => match kind {
-            CaptureKind::Raw { port, clear, clear_only, addr } => {
-                cmd_capture_raw(&addr, &port, clear, clear_only)
-            }
-            CaptureKind::Events { port, since, clear, clear_only, addr } => {
-                cmd_capture_events(&addr, &port, since, clear, clear_only)
-            }
+            CaptureKind::Raw {
+                port,
+                clear,
+                clear_only,
+                addr,
+            } => cmd_capture_raw(&addr, &port, clear, clear_only),
+            CaptureKind::Events {
+                port,
+                since,
+                clear,
+                clear_only,
+                addr,
+            } => cmd_capture_events(&addr, &port, since, clear, clear_only),
         },
         Cmd::Completions { shell } => {
             print_completions(shell);
@@ -231,7 +246,11 @@ fn fetch_string_array(addr: &str, path: &str, field: &str) -> Vec<String> {
     };
     v.get(field)
         .and_then(|s| s.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -532,7 +551,12 @@ fn cmd_ports(addr: &str, port: Option<&str>) -> Result<(), String> {
 
 fn cmd_scenario(addr: &str, port: &str, scenario: &str) -> Result<(), String> {
     let body = format!("{{\"scenario\":\"{}\"}}", escape(scenario));
-    let (status, resp) = http(addr, "POST", &format!("/ports/{}/scenario", port), body.as_bytes())?;
+    let (status, resp) = http(
+        addr,
+        "POST",
+        &format!("/ports/{}/scenario", port),
+        body.as_bytes(),
+    )?;
     print_body(status, &resp);
     if status >= 400 {
         return Err(format!("HTTP {}", status));
@@ -625,14 +649,9 @@ fn print_body(status: u16, body: &[u8]) {
 /// Minimal HTTP/1.1 client. Returns `(status_code, body_bytes)`.
 /// `addr` is `host:port`. `path` starts with `/`.
 fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
-    let mut stream = TcpStream::connect(addr)
-        .map_err(|e| format!("connect {}: {}", addr, e))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {}: {}", addr, e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
@@ -645,17 +664,21 @@ fn http(addr: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {}", e))?;
     if !body.is_empty() {
-        stream.write_all(body).map_err(|e| format!("write body: {}", e))?;
+        stream
+            .write_all(body)
+            .map_err(|e| format!("write body: {}", e))?;
     }
 
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read: {}", e))?;
     let split = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("malformed response: no header terminator")?;
-    let head = std::str::from_utf8(&buf[..split])
-        .map_err(|e| format!("non-utf8 headers: {}", e))?;
+    let head =
+        std::str::from_utf8(&buf[..split]).map_err(|e| format!("non-utf8 headers: {}", e))?;
     let status_line = head.lines().next().ok_or("empty response")?;
     let status: u16 = status_line
         .split_whitespace()

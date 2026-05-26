@@ -130,9 +130,14 @@ fn read_pty_paths(stdout: &mut impl Read) -> Vec<String> {
 
 /// Trivial HTTP/1.1 client. Returns `(status_code, body_bytes)`.
 fn http(method: &str, host_path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-    let (host, path) = host_path.split_once('/').map(|(h, p)| (h.to_string(), format!("/{}", p))).unwrap();
+    let (host, path) = host_path
+        .split_once('/')
+        .map(|(h, p)| (h.to_string(), format!("/{}", p)))
+        .unwrap();
     let mut stream = TcpStream::connect(&host).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
         method = method,
@@ -154,11 +159,7 @@ fn http(method: &str, host_path: &str, body: &[u8]) -> (u16, Vec<u8>) {
         .expect("malformed response");
     let head = &buf[..split];
     let body = buf[split + 4..].to_vec();
-    let status_line = std::str::from_utf8(head)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap();
+    let status_line = std::str::from_utf8(head).unwrap().lines().next().unwrap();
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -334,11 +335,7 @@ fn unknown_endpoints_return_404() {
     assert_eq!(status, 404);
     let (status, _) = http("GET", &svc.url("/ports/missing"), &[]);
     assert_eq!(status, 404);
-    let (status, _) = http(
-        "POST",
-        &svc.url("/ports/scale-1/triggers/ghost"),
-        &[],
-    );
+    let (status, _) = http("POST", &svc.url("/ports/scale-1/triggers/ghost"), &[]);
     assert_eq!(status, 404);
 }
 
@@ -370,7 +367,11 @@ fn poll_events(svc: &Service, expected_count: usize, timeout: Duration) -> Strin
     let deadline = Instant::now() + timeout;
     let mut last = String::new();
     while Instant::now() < deadline {
-        let (status, body) = http("GET", &svc.url("/ports/scale-1/capture/events?since=0"), &[]);
+        let (status, body) = http(
+            "GET",
+            &svc.url("/ports/scale-1/capture/events?since=0"),
+            &[],
+        );
         assert_eq!(status, 200);
         last = String::from_utf8(body).unwrap();
         // Crude count: number of `"id":` substrings.

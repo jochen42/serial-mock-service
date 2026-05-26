@@ -35,7 +35,10 @@ impl PortMap {
     }
 
     pub fn insert(&self, state: Arc<PortState>) {
-        self.inner.write().unwrap().insert(state.name.clone(), state);
+        self.inner
+            .write()
+            .unwrap()
+            .insert(state.name.clone(), state);
     }
 
     pub fn remove(&self, name: &str) -> Option<Arc<PortState>> {
