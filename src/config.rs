@@ -58,7 +58,9 @@ pub struct HttpConfig {
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 
@@ -99,8 +101,12 @@ impl Default for CaptureConfig {
     }
 }
 
-fn default_max_events() -> usize { 1000 }
-fn default_max_raw_bytes() -> usize { 65536 }
+fn default_max_events() -> usize {
+    1000
+}
+fn default_max_raw_bytes() -> usize {
+    65536
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ScenarioConfig {
@@ -157,10 +163,9 @@ impl MatchConfig {
 /// Load and validate YAML from disk. Returns a descriptive error on
 /// any failure so the operator sees what to fix.
 pub fn load(path: &Path) -> Result<Config, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let cfg: Config = serde_yaml::from_str(&raw)
-        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let cfg: Config =
+        serde_yaml::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -172,7 +177,10 @@ fn validate(cfg: &Config) -> Result<(), String> {
             return Err(format!("duplicate port name: {}", port.name));
         }
         if port.scenarios.is_empty() {
-            return Err(format!("port {}: must declare at least one scenario", port.name));
+            return Err(format!(
+                "port {}: must declare at least one scenario",
+                port.name
+            ));
         }
         let mut scenario_names = HashSet::new();
         let mut found_initial = false;
@@ -198,7 +206,10 @@ fn validate(cfg: &Config) -> Result<(), String> {
             // Validate each match is well-formed and regexes compile.
             for (idx, rule) in sc.input_rules.iter().enumerate() {
                 let resolved = rule.match_.resolve().map_err(|e| {
-                    format!("port {} scenario {} rule {}: {}", port.name, sc.name, idx, e)
+                    format!(
+                        "port {} scenario {} rule {}: {}",
+                        port.name, sc.name, idx, e
+                    )
                 })?;
                 if let Match::Regex(p) = resolved {
                     regex::Regex::new(&p).map_err(|e| {
@@ -225,8 +236,7 @@ mod tests {
     use super::*;
 
     fn parse(yaml: &str) -> Result<Config, String> {
-        let cfg: Config =
-            serde_yaml::from_str(yaml).map_err(|e| format!("parse: {}", e))?;
+        let cfg: Config = serde_yaml::from_str(yaml).map_err(|e| format!("parse: {}", e))?;
         validate(&cfg)?;
         Ok(cfg)
     }

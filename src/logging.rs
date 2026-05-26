@@ -10,8 +10,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::{LogFormat, LoggingConfig};
 
 pub fn init(cfg: &LoggingConfig) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.level));
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
 

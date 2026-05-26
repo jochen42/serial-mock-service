@@ -26,6 +26,29 @@ impl Matcher {
     }
 }
 
+pub fn compile_rules(rules: &[InputRuleConfig]) -> Result<Vec<CompiledRule>, String> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            let resolved = r
+                .match_
+                .resolve()
+                .map_err(|e| format!("rule {}: {}", idx, e))?;
+            let matcher = match resolved {
+                Match::Exact(s) => Matcher::Exact(s.into_bytes()),
+                Match::Regex(p) => Matcher::Regex(
+                    Regex::new(&p).map_err(|e| format!("rule {}: regex {:?}: {}", idx, p, e))?,
+                ),
+            };
+            Ok(CompiledRule {
+                matcher,
+                response: r.response.as_bytes().to_vec(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,28 +103,4 @@ mod tests {
         let rules = compile_rules(&[exact("Q", "S S  12.50 kg\r\n")]).unwrap();
         assert_eq!(rules[0].response, b"S S  12.50 kg\r\n");
     }
-}
-
-pub fn compile_rules(rules: &[InputRuleConfig]) -> Result<Vec<CompiledRule>, String> {
-    rules
-        .iter()
-        .enumerate()
-        .map(|(idx, r)| {
-            let resolved = r
-                .match_
-                .resolve()
-                .map_err(|e| format!("rule {}: {}", idx, e))?;
-            let matcher = match resolved {
-                Match::Exact(s) => Matcher::Exact(s.into_bytes()),
-                Match::Regex(p) => Matcher::Regex(
-                    Regex::new(&p)
-                        .map_err(|e| format!("rule {}: regex {:?}: {}", idx, p, e))?,
-                ),
-            };
-            Ok(CompiledRule {
-                matcher,
-                response: r.response.as_bytes().to_vec(),
-            })
-        })
-        .collect()
 }

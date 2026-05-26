@@ -216,7 +216,12 @@ fn switch_scenario(
     };
     let parsed: Result<ScenarioSwitch, _> = serde_json::from_slice(body);
     let Ok(payload) = parsed else {
-        return respond_json(stream, 400, "Bad Request", "{\"error\":\"expected {\\\"scenario\\\":\\\"name\\\"}\"}");
+        return respond_json(
+            stream,
+            400,
+            "Bad Request",
+            "{\"error\":\"expected {\\\"scenario\\\":\\\"name\\\"}\"}",
+        );
     };
     if let Err(e) = state.switch_scenario(&payload.scenario) {
         return respond_json(
