@@ -19,6 +19,8 @@ ports:
             response: "N:                S S      0.079 kg\r\nT:                         0.000 kg\r\nG:                         0.079 kg\r\n"
           - name: print_heavy
             response: "N:                S S    123.450 kg\r\nT:                         0.000 kg\r\nG:                       123.450 kg\r\n"
+          - name: print_another
+            response: "N:                S S    55.450 kg\r\nT: 7.000 kg\r\nG:                       48.450 kg\r\n"
           - name: tare_ok
             response: "T:                         0.079 kg\r\n"
         input_rules:
