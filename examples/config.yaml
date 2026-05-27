@@ -36,11 +36,25 @@ ports:
           - match: { exact: "Q\r\n" }
             response: "ERR\r\n"
 
-  - name: scale-2
+  # Shimadzu MOC63u moisture analyzer. Print-only device: it emits a
+  # multi-line report at the printer port when a measurement finishes.
+  # No input/ping is supported, so there are no input_rules — the
+  # triggers below reproduce the printer dumps. The downstream parser
+  # flushes a reading when the `Dry W(g)` line arrives, so each report
+  # ends with that line.
+  - name: moisture-1
     initial_scenario: idle
-    symlink: /tmp/tty.mock-scale-2
+    symlink: /tmp/tty.mock-moisture-1
     scenarios:
       - name: idle
         triggers:
-          - name: ping
-            response: "PONG\r\n"
+          # Completed AUTO measurement with intermediate steps; final
+          # step marked with a leading '*'.
+          - name: print
+            response: "SHIMADZU CORP.\r\nTYPE MOC63u\r\nSN D123456789\r\nID 0001\r\nCODE 100\r\nDATE 27-05-26\r\nTIME 14:32\r\nPNO. 1\r\nUNIT M/W\r\nMODE AUTO\r\nTEMP 105\r\nSTOP 0.05 %\r\n0:00:30   2.15\r\n0:01:00   4.80\r\n0:01:30   6.12\r\n*0:02:00   6.45\r\nWet W(g)   12.345\r\nDry W(g)   11.548\r\n"
+          # Measurement aborted mid-run; abort step marked with '*'.
+          - name: print_aborted
+            response: "SHIMADZU CORP.\r\nTYPE MOC63u\r\nSN D123456789\r\nID 0002\r\nCODE 100\r\nDATE 27-05-26\r\nTIME 14:40\r\nPNO. 1\r\nUNIT M/W\r\nMODE AUTO\r\nTEMP 105\r\nSTOP 0.05 %\r\n0:00:30   1.02\r\n*0:01:00   ABORT\r\nWet W(g)   10.500\r\nDry W(g)   10.394\r\n"
+          # Dry-content/wet-base report in TIME mode, no intermediate steps.
+          - name: print_dry_base
+            response: "SHIMADZU CORP.\r\nTYPE MOC63u\r\nSN D123456789\r\nID 0003\r\nCODE 200\r\nDATE 27-05-26\r\nTIME 15:05\r\nPNO. 2\r\nUNIT D/W\r\nMODE TIME\r\nTEMP 120\r\nSTOP 0.10 %\r\n*0:05:00   8.73\r\nWet W(g)   9.870\r\nDry W(g)   9.008\r\n"
