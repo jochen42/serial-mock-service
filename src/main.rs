@@ -10,15 +10,18 @@ use std::sync::Arc;
 use clap::Parser;
 use tracing::{error, info};
 
+mod bytes;
 mod capture;
 mod cli;
 mod config;
+mod framing;
 mod http;
 mod logging;
 mod matching;
 mod port;
 mod reload;
 mod server;
+mod transport;
 
 use crate::cli::{Cli, Cmd};
 use crate::port::PortState;
@@ -56,11 +59,11 @@ fn serve(config_path: PathBuf) -> ExitCode {
             Ok(state) => {
                 info!(
                     port = %state.name,
-                    slave = %state.pty_path.display(),
+                    slave = %state.device_path_str(),
                     initial_scenario = %port_cfg.initial_scenario,
                     "port {}: slave = {}",
                     state.name,
-                    state.pty_path.display(),
+                    state.device_path_str(),
                 );
                 server.ports.insert(state);
             }

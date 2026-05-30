@@ -60,11 +60,52 @@ ports:
 ```
 
 - `triggers`: named static byte strings the API can push to the device on demand.
-- `input_rules`: when a `\n`-terminated line arrives from the device, walk the rules in order; the first match's `response` is written back.
-- `match` is either `{ exact: "..." }` or `{ regex: "..." }`. Regexes use the Rust [`regex`](https://docs.rs/regex) crate (bytes mode, anchored to whatever you write — typical: `^...$`).
+- `input_rules`: when a frame arrives from the device, walk the rules in order; the first match's `response` is written back.
+- `match` is `{ exact: ... }`, `{ regex: "..." }`, or `{ mask: { pattern: ..., mask: ... } }`. Regexes use the Rust [`regex`](https://docs.rs/regex) crate (bytes mode, anchored to whatever you write — typical: `^...$`). `mask` matches byte-for-byte where the mask bit is set and ignores positions where it's clear — handy for frames with variable fields (sequence numbers, payloads).
 - YAML double-quoted strings carry `\r\n` natively. No double-escaping.
 
-Validation runs at load and on every SIGHUP — duplicate names, unknown `initial_scenario`, malformed regex all abort the (re)load without disturbing running ports.
+Validation runs at load and on every SIGHUP — duplicate names, unknown `initial_scenario`, malformed regex, bad framing/mask parameters all abort the (re)load without disturbing running ports.
+
+### Binary protocols
+
+Any `match` or `response` value accepts binary, not just a plain string:
+
+```yaml
+response: "S S  12.50 kg\r\n"   # plain string -> its UTF-8 bytes (default)
+response: { hex: "02 51 03" }    # whitespace / ':' / '0x' tolerated
+response: { base64: "AlED" }
+response: { bytes: [2, 81, 3] }  # raw byte array
+```
+
+Plain strings keep working exactly as before — only a mapping triggers binary decoding.
+
+Binary devices rarely use `\n` framing, so a port may declare a `framing` strategy (a port-level property, independent of scenario). Absent `framing` means the legacy newline-delimited behavior.
+
+```yaml
+ports:
+  - name: sensor-1
+    framing: { type: delimiter, delimiter: { hex: "0D 0A" }, include_delimiter: true }
+    # framing: { type: fixed, length: 8 }
+    # framing: { type: length_prefixed, header_size: 2, length_offset: 1,
+    #            length_size: 1, length_endian: big, length_includes: payload, trailer_size: 0 }
+    # framing: { type: idle_timeout, quiet_ms: 50 }   # flush after a quiet gap
+```
+
+- `delimiter` — cut on a byte sequence (generalizes `\n`); `include_delimiter` keeps or strips it.
+- `fixed` — every frame is exactly `length` bytes.
+- `length_prefixed` — a header field at `length_offset` (`length_size` = 1/2/4 bytes, `length_endian`) declares the length; `length_includes` is `payload` (header + N + trailer) or `frame` (the value is the whole frame size).
+- `idle_timeout` — no delimiter; accumulate bytes and emit a frame after `quiet_ms` of silence.
+
+### Virtual USB (USB-serial / CDC-ACM)
+
+A USB-serial adapter enumerates as an ordinary tty, so there is nothing USB-specific to mock at the byte level — point a port's `transport` at the device path and all matching/framing applies unchanged:
+
+```yaml
+transport: { type: pty }                     # default: allocate a fresh PTY
+transport: { type: tty, path: /dev/ttyACM0 } # bind an existing USB-serial tty
+```
+
+On Linux this is typically `/dev/ttyACM0`, or `/dev/ttyGS0` from a `g_serial`/`dummy_hcd` gadget; on macOS a `/dev/tty.usbserial-*`. Genuine raw-USB emulation (arbitrary VID/PID, custom endpoints/control transfers) is out of scope — that needs a Linux USB gadget (configfs/FunctionFS) or USB/IP and is not possible on macOS.
 
 ### serial tools can't see the device
 
@@ -111,7 +152,7 @@ Event shape:
 { "id": 42, "ts_ms": 1715692800123, "data_hex": "510d0a", "matched_rule": "idle:0" }
 ```
 
-`matched_rule` is `"<scenario>:<rule_index>"` or `null`. `data_hex` is the entire received line including `\n` terminator.
+`matched_rule` is `"<scenario>:<rule_index>"` or `null`. `data_hex` is the entire received frame (for the default newline framing, the line including its `\n` terminator).
 
 ### Examples
 
@@ -199,7 +240,10 @@ The binary must be reachable as `serial-mock-service` on `$PATH` for dynamic loo
 src/
 ├── main.rs       — arg parse, port spawn, signal install, HTTP loop
 ├── config.rs     — YAML schema + validation
-├── matching.rs   — compiled exact/regex matchers (regex::bytes)
+├── bytes.rs      — Bytes literal (string | hex | base64 | byte array)
+├── matching.rs   — compiled exact/regex/mask matchers (regex::bytes)
+├── framing.rs    — frame extraction (delimiter/fixed/length-prefixed/idle)
+├── transport.rs  — transport backends (PTY, existing tty)
 ├── capture.rs    — bounded raw ring + event log
 ├── port.rs       — PortState, reader thread, trigger/match helpers
 ├── server.rs     — PortMap (RwLock<HashMap>)
@@ -207,9 +251,9 @@ src/
 └── reload.rs     — signal-hook SIGHUP thread + config diff/apply
 ```
 
-Per port a dedicated thread does blocking `read()` on the PTY master, captures bytes, and on each `\n`-terminated line runs the active scenario's input rules. HTTP handlers share the same `Arc<PortState>` to fire triggers and switch scenarios.
+Per port a dedicated thread does blocking `read()` on the transport, captures bytes, feeds them to the port's framer, and runs the active scenario's input rules against each completed frame. HTTP handlers share the same `Arc<PortState>` to fire triggers and switch scenarios.
 
-The slave fd is intentionally held open inside the service (`slave_keepalive`) so the master's blocking `read()` doesn't return EOF on macOS when no external consumer is attached.
+For a PTY transport the slave fd is intentionally held open inside the service (the `keepalive` fd) so the master's blocking `read()` doesn't return EOF on macOS when no external consumer is attached.
 
 ## Testing
 
