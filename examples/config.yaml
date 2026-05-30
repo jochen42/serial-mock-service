@@ -72,3 +72,55 @@ ports:
           # Dry-content/wet-base report in TIME mode, no intermediate steps.
           - name: print_dry_base
             response: "SHIMADZU CORP.\r\nTYPE MOC63u\r\nSN D123456789\r\nID 0003\r\nCODE 200\r\nDATE 27-05-26\r\nTIME 15:05\r\nPNO. 2\r\nUNIT D/W\r\nMODE TIME\r\nTEMP 120\r\nSTOP 0.10 %\r\n*0:05:00   8.73\r\nWet W(g)   9.870\r\nDry W(g)   9.008\r\n"
+
+  # ---------------------------------------------------------------------
+  # Binary protocol device.
+  #
+  # `framing` describes how the wire byte-stream is cut into frames (it is
+  # a port-level property, independent of scenario). Here a length-prefixed
+  # frame: [STX=0x02][LEN:1][payload(LEN bytes)], where LEN counts only the
+  # payload. Other framing types: `delimiter`, `fixed`, `idle_timeout`.
+  #
+  # Matches and responses accept binary via `{ hex: ... }`, `{ base64: ... }`
+  # or `{ bytes: [..] }` in addition to plain strings. `mask` matching lets
+  # individual bytes be don't-cares.
+  - name: sensor-1
+    initial_scenario: idle
+    symlink: /tmp/tty.mock-sensor-1
+    framing:
+      type: length_prefixed
+      header_size: 2 # bytes before payload (STX + LEN)
+      length_offset: 1 # LEN field sits at byte 1
+      length_size: 1 # LEN is one byte
+      length_endian: big # big | little (irrelevant for 1-byte fields)
+      length_includes: payload # payload | frame
+      trailer_size: 0 # trailing checksum bytes, if any
+    scenarios:
+      - name: idle
+        input_rules:
+          # Exact frame: STX 03 'Q' 'U' 'E'  ->  ACK + a 16-bit reading.
+          - match: { exact: { hex: "02 03 51 55 45" } }
+            response: { hex: "06 02 99 7F" }
+          # Mask: STX, any LEN byte, then 'P' 'I' 'N'  ->  single ACK byte.
+          - match:
+              mask:
+                pattern: { hex: "02 00 50 49 4E" }
+                mask: { hex: "FF 00 FF FF FF" }
+            response: { base64: "Bg==" } # 0x06
+
+  # ---------------------------------------------------------------------
+  # USB-serial (CDC-ACM) device.
+  #
+  # A USB serial adapter enumerates as an ordinary tty, so binding it is
+  # just a transport change — all matching/framing works identically. On
+  # Linux this might be /dev/ttyACM0 or a /dev/ttyGS0 gadget; on macOS a
+  # /dev/tty.usbserial-*. Uncomment and point `path` at a real device.
+  #
+  # - name: usb-scale
+  #   initial_scenario: idle
+  #   transport: { type: tty, path: /dev/ttyACM0 }
+  #   scenarios:
+  #     - name: idle
+  #       input_rules:
+  #         - match: { exact: "Q\r\n" }
+  #           response: "S S  12.50 kg\r\n"

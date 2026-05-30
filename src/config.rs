@@ -10,6 +10,10 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::bytes::Bytes;
+use crate::framing::FramingConfig;
+use crate::transport::TransportConfig;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
@@ -79,6 +83,15 @@ pub struct PortConfig {
     /// stable path here at least lets test scripts pin to one name.
     #[serde(default)]
     pub symlink: Option<std::path::PathBuf>,
+    /// Transport backend. Absent means a fresh PTY (the legacy default).
+    /// Use `{ type: tty, path: ... }` to bind a USB-serial (CDC-ACM) tty.
+    #[serde(default)]
+    pub transport: TransportConfig,
+    /// Wire framing strategy. Absent means newline-delimited (the legacy
+    /// behavior). Framing is a port-level property because it describes
+    /// how the device chops its byte stream, independent of scenario.
+    #[serde(default)]
+    pub framing: Option<FramingConfig>,
     #[serde(default)]
     pub capture: CaptureConfig,
     pub scenarios: Vec<ScenarioConfig>,
@@ -120,17 +133,20 @@ pub struct ScenarioConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct TriggerConfig {
     pub name: String,
-    pub response: String,
+    pub response: Bytes,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct InputRuleConfig {
     #[serde(rename = "match")]
     pub match_: MatchConfig,
-    pub response: String,
+    pub response: Bytes,
 }
 
-/// YAML shape: `match: { exact: "..." }` or `match: { regex: "..." }`.
+/// YAML shape: `match: { exact: ... }`, `match: { regex: "..." }`, or
+/// `match: { mask: { pattern: ..., mask: ... } }`. `exact` accepts any
+/// `Bytes` encoding (string/hex/base64/array); `regex` is a pattern
+/// string compiled against the frame bytes.
 ///
 /// Modeled as a struct with optional fields because serde_yaml 0.9
 /// expects YAML tags (`!exact`) for externally-tagged enums, which
@@ -138,24 +154,62 @@ pub struct InputRuleConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct MatchConfig {
     #[serde(default)]
-    pub exact: Option<String>,
+    pub exact: Option<Bytes>,
     #[serde(default)]
     pub regex: Option<String>,
+    #[serde(default)]
+    pub mask: Option<MaskConfig>,
+}
+
+/// Wildcard byte matching: a frame matches when, for every position,
+/// `(frame[i] & mask[i]) == (pattern[i] & mask[i])`. Lengths must be
+/// equal (enforced in validation).
+#[derive(Debug, Deserialize, Clone)]
+pub struct MaskConfig {
+    pub pattern: Bytes,
+    pub mask: Bytes,
 }
 
 #[derive(Debug, Clone)]
 pub enum Match {
-    Exact(String),
+    Exact(Vec<u8>),
     Regex(String),
+    Mask { pattern: Vec<u8>, mask: Vec<u8> },
 }
 
 impl MatchConfig {
     pub fn resolve(&self) -> Result<Match, String> {
-        match (&self.exact, &self.regex) {
-            (Some(e), None) => Ok(Match::Exact(e.clone())),
-            (None, Some(r)) => Ok(Match::Regex(r.clone())),
-            (None, None) => Err("match: must set either `exact` or `regex`".into()),
-            (Some(_), Some(_)) => Err("match: set only one of `exact` or `regex`".into()),
+        let set = [
+            self.exact.is_some(),
+            self.regex.is_some(),
+            self.mask.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        match set {
+            0 => Err("match: must set one of `exact`, `regex`, or `mask`".into()),
+            1 => {
+                if let Some(e) = &self.exact {
+                    Ok(Match::Exact(e.0.clone()))
+                } else if let Some(r) = &self.regex {
+                    Ok(Match::Regex(r.clone()))
+                } else {
+                    let m = self.mask.as_ref().unwrap();
+                    if m.pattern.0.len() != m.mask.0.len() {
+                        return Err(format!(
+                            "match: mask pattern ({} bytes) and mask ({} bytes) must be equal length",
+                            m.pattern.0.len(),
+                            m.mask.0.len()
+                        ));
+                    }
+                    Ok(Match::Mask {
+                        pattern: m.pattern.0.clone(),
+                        mask: m.mask.0.clone(),
+                    })
+                }
+            }
+            _ => Err("match: set only one of `exact`, `regex`, or `mask`".into()),
         }
     }
 }
@@ -175,6 +229,11 @@ fn validate(cfg: &Config) -> Result<(), String> {
     for port in &cfg.ports {
         if !port_names.insert(&port.name) {
             return Err(format!("duplicate port name: {}", port.name));
+        }
+        if let Some(framing) = &port.framing {
+            framing
+                .validate()
+                .map_err(|e| format!("port {}: {}", port.name, e))?;
         }
         if port.scenarios.is_empty() {
             return Err(format!(
@@ -328,7 +387,7 @@ ports:
             response: "X"
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.contains("only one of"), "{}", err);
+        assert!(err.contains("only one"), "{}", err);
     }
 
     #[test]
@@ -345,6 +404,45 @@ ports:
             response: "X"
 "#;
         let err = parse(yaml).unwrap_err();
-        assert!(err.contains("either"), "{}", err);
+        assert!(err.contains("must set one"), "{}", err);
+    }
+
+    #[test]
+    fn match_exact_accepts_hex() {
+        let yaml = r#"
+ports:
+  - name: p
+    initial_scenario: s
+    scenarios:
+      - name: s
+        triggers: []
+        input_rules:
+          - match: { exact: { hex: "02 51 03" } }
+            response: { hex: "06" }
+"#;
+        let cfg = parse(yaml).unwrap();
+        let rule = &cfg.ports[0].scenarios[0].input_rules[0];
+        assert_eq!(rule.response.0, vec![0x06]);
+        match rule.match_.resolve().unwrap() {
+            Match::Exact(b) => assert_eq!(b, vec![0x02, 0x51, 0x03]),
+            other => panic!("expected exact, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mask_unequal_lengths_rejected() {
+        let yaml = r#"
+ports:
+  - name: p
+    initial_scenario: s
+    scenarios:
+      - name: s
+        triggers: []
+        input_rules:
+          - match: { mask: { pattern: { hex: "AA 55" }, mask: { hex: "FF" } } }
+            response: "X"
+"#;
+        let err = parse(yaml).unwrap_err();
+        assert!(err.contains("equal length"), "{}", err);
     }
 }

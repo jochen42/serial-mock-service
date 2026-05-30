@@ -53,7 +53,7 @@ fn apply(server: &Arc<Server>, new_cfg: Config) {
                 Ok(state) => {
                     info!(
                         port = %state.name,
-                        slave = %state.pty_path.display(),
+                        slave = %state.device_path_str(),
                         "port spawned on reload",
                     );
                     server.ports.insert(state);

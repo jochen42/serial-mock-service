@@ -7,20 +7,20 @@
 // scenarios.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
-use nix::pty::openpty;
-use nix::unistd::ttyname;
 use tracing::{info, warn};
 
 use crate::capture::Capture;
 use crate::config::{PortConfig, ScenarioConfig};
+use crate::framing::FramingSpec;
 use crate::matching::{compile_rules, CompiledRule};
+use crate::transport::ReadSource;
 
 /// Pre-compiled, ready-to-execute view of a scenario.
 pub struct CompiledScenario {
@@ -37,30 +37,46 @@ pub struct CompiledPort {
 
 pub struct PortState {
     pub name: String,
-    pub pty_path: PathBuf,
-    /// Optional stable symlink to `pty_path`. Created on spawn,
+    /// Client-visible device path (PTY slave, or the bound tty), if any.
+    pub device_path: Option<PathBuf>,
+    /// Optional stable symlink to `device_path`. Created on spawn,
     /// removed on drop.
     pub symlink: Option<PathBuf>,
-    pub master: Mutex<File>,
+    /// Write half of the transport, behind a mutex so triggers and
+    /// input-rule responses serialize. `Box<dyn Write>` so any backend
+    /// (PTY master, tty) plugs in.
+    pub writer: Mutex<Box<dyn Write + Send>>,
     pub active: RwLock<Arc<CompiledScenario>>,
     pub compiled: RwLock<Arc<CompiledPort>>,
+    /// Wire framing for the reader thread. Held in an `Arc` so the reader
+    /// can cheaply snapshot it each iteration, and behind an `RwLock` so
+    /// reload can swap it without restarting the thread.
+    pub framing: RwLock<Arc<FramingSpec>>,
     pub capture: Mutex<Capture>,
-    /// Held only to keep the slave end open inside the kernel — on
-    /// macOS the master `read()` returns EIO/EOF whenever the slave
-    /// has no open file descriptors anywhere in the system. Keeping
-    /// our own dummy reference makes the master block (as a real
-    /// serial port would) until external consumers attach.
+    /// Optional fd kept open to hold a kernel resource alive for the
+    /// port's lifetime (the PTY slave keepalive; `None` for tty). See
+    /// [`crate::transport::Opened::keepalive`].
     #[allow(dead_code)]
-    slave_keepalive: OwnedFd,
+    keepalive: Option<OwnedFd>,
+}
+
+impl PortState {
+    /// Device path as a display string for logs/JSON, or `<none>`.
+    pub fn device_path_str(&self) -> String {
+        self.device_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    }
 }
 
 impl Drop for PortState {
     fn drop(&mut self) {
-        if let Some(link) = &self.symlink {
-            // Only unlink if it actually points to our PTY — never
+        if let (Some(link), Some(target)) = (&self.symlink, &self.device_path) {
+            // Only unlink if it actually points to our device — never
             // delete a user file by accident.
-            if let Ok(target) = std::fs::read_link(link) {
-                if target == self.pty_path {
+            if let Ok(actual) = std::fs::read_link(link) {
+                if &actual == target {
                     let _ = std::fs::remove_file(link);
                 }
             }
@@ -79,58 +95,54 @@ impl PortState {
             .cloned()
             .ok_or_else(|| format!("port {}: initial scenario missing", cfg.name))?;
 
-        let pty = openpty(None, None).map_err(|e| format!("port {}: openpty: {}", cfg.name, e))?;
-
-        let pty_path =
-            ttyname(&pty.slave).map_err(|e| format!("port {}: ttyname: {}", cfg.name, e))?;
-
-        let slave_keepalive = pty.slave;
-
-        let master_fd = pty.master.into_raw_fd();
-        let master_file = unsafe { File::from_raw_fd(master_fd) };
-
-        // Reader thread needs an independent File handle so it can
-        // read while triggers hold the write mutex.
-        let reader_file = master_file
-            .try_clone()
-            .map_err(|e| format!("port {}: dup master: {}", cfg.name, e))?;
+        let opened = crate::transport::open(&cfg.transport)
+            .map_err(|e| format!("port {}: open transport: {}", cfg.name, e))?;
+        let crate::transport::Opened {
+            reader,
+            writer,
+            device_path,
+            keepalive,
+        } = opened;
 
         // Symlink is a convenience for clients pinning to a stable
         // device path. Failure (most commonly: macOS devfs refuses
         // writes under /dev) is logged and the port still starts —
-        // the real PTY at `pty_path` works regardless.
-        let symlink = match &cfg.symlink {
-            None => None,
-            Some(link) => match create_symlink(link, &pty_path) {
+        // the real device path works regardless.
+        let symlink = match (&cfg.symlink, &device_path) {
+            (Some(link), Some(target)) => match create_symlink(link, target) {
                 Ok(()) => Some(link.clone()),
                 Err(e) => {
                     warn!(
                         port = %cfg.name,
                         link = %link.display(),
-                        target = %pty_path.display(),
+                        target = %target.display(),
                         error = %e,
-                        "could not create symlink; port still usable via PTY path",
+                        "could not create symlink; port still usable via device path",
                     );
                     None
                 }
             },
+            _ => None,
         };
+
+        let framing = Arc::new(FramingSpec::from_config(cfg.framing.as_ref()));
 
         let state = Arc::new(PortState {
             name: cfg.name.clone(),
-            pty_path: pty_path.clone(),
+            device_path,
             symlink,
-            master: Mutex::new(master_file),
+            writer: Mutex::new(writer),
             active: RwLock::new(initial),
             compiled: RwLock::new(compiled),
+            framing: RwLock::new(framing),
             capture: Mutex::new(Capture::new(
                 cfg.capture.max_raw_bytes,
                 cfg.capture.max_events,
             )),
-            slave_keepalive,
+            keepalive,
         });
 
-        spawn_reader(state.clone(), reader_file);
+        spawn_reader(state.clone(), reader);
 
         Ok(state)
     }
@@ -149,8 +161,10 @@ impl PortState {
                 .or_else(|| compiled.scenarios.get(&cfg.initial_scenario).cloned())
                 .ok_or_else(|| format!("port {}: no usable scenario after reload", cfg.name))?
         };
+        let framing = Arc::new(FramingSpec::from_config(cfg.framing.as_ref()));
         *self.compiled.write().unwrap() = compiled;
         *self.active.write().unwrap() = new_active;
+        *self.framing.write().unwrap() = framing;
         Ok(())
     }
 
@@ -173,8 +187,8 @@ impl PortState {
     /// logic can be unit-tested against an arbitrary `Write` sink.
     pub fn fire_trigger(&self, name: &str) -> Result<Vec<u8>, String> {
         let scenario = self.active.read().unwrap().clone();
-        let mut master = self.master.lock().unwrap();
-        fire_trigger_on(&scenario, name, &mut *master)
+        let mut writer = self.writer.lock().unwrap();
+        fire_trigger_on(&scenario, name, &mut *writer)
     }
 }
 
@@ -285,7 +299,7 @@ fn compile_scenario(sc: &ScenarioConfig) -> Result<CompiledScenario, String> {
     let triggers = sc
         .triggers
         .iter()
-        .map(|t| (t.name.clone(), t.response.as_bytes().to_vec()))
+        .map(|t| (t.name.clone(), t.response.0.clone()))
         .collect();
     let input_rules =
         compile_rules(&sc.input_rules).map_err(|e| format!("scenario {}: {}", sc.name, e))?;
@@ -296,21 +310,40 @@ fn compile_scenario(sc: &ScenarioConfig) -> Result<CompiledScenario, String> {
     })
 }
 
-fn spawn_reader(state: Arc<PortState>, mut reader: File) {
+fn spawn_reader(state: Arc<PortState>, reader: Box<dyn ReadSource>) {
     let thread_name = format!("port-reader:{}", state.name);
     thread::Builder::new()
         .name(thread_name)
-        .spawn(move || reader_loop(state, &mut reader))
+        .spawn(move || reader_loop(state, reader))
         .expect("spawn reader thread");
 }
 
-const MAX_LINE_BYTES: usize = 4096;
-
-fn reader_loop(state: Arc<PortState>, reader: &mut File) {
-    let mut buf = [0u8; 1024];
-    let mut line = Vec::with_capacity(256);
+fn reader_loop(state: Arc<PortState>, mut reader: Box<dyn ReadSource>) {
+    let fd = reader.raw_fd();
+    let mut readbuf = [0u8; 1024];
+    // The framing buffer persists across reads (a frame may span chunks)
+    // and across reloads (the spec swaps, the in-flight bytes don't).
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
     loop {
-        let n = match reader.read(&mut buf) {
+        // Snapshot the current framing spec (cheap Arc clone). Reload can
+        // swap it between iterations.
+        let spec = state.framing.read().unwrap().clone();
+
+        // Idle-timeout framing: wait with a deadline; on a quiet gap flush
+        // whatever has accumulated.
+        if let Some(timeout) = spec.idle_timeout() {
+            if !wait_readable(fd, timeout) {
+                frames.clear();
+                spec.on_idle(&mut buf, &mut frames);
+                for f in frames.drain(..) {
+                    handle_frame(&state, f);
+                }
+                continue;
+            }
+        }
+
+        let n = match reader.read(&mut readbuf) {
             Ok(0) => {
                 info!(port = %state.name, "EOF on master, reader exiting");
                 return;
@@ -321,7 +354,7 @@ fn reader_loop(state: Arc<PortState>, reader: &mut File) {
                 return;
             }
         };
-        let chunk = &buf[..n];
+        let chunk = &readbuf[..n];
 
         // Always capture the raw bytes first.
         {
@@ -329,36 +362,39 @@ fn reader_loop(state: Arc<PortState>, reader: &mut File) {
             cap.append_raw(chunk);
         }
 
-        // Line-buffered matching: feed bytes into `line`, on each `\n`
-        // run rules against the completed line (terminator included).
-        for &b in chunk {
-            if line.len() >= MAX_LINE_BYTES {
-                // Pathological input with no newline — flush as an
-                // unmatched event so the buffer cannot grow forever.
-                let bytes = std::mem::take(&mut line);
-                state.capture.lock().unwrap().push_event(bytes, None);
-            }
-            line.push(b);
-            if b == b'\n' {
-                let bytes = std::mem::take(&mut line);
-                handle_line(&state, bytes);
-            }
+        // Feed the framer; handle each completed frame in order.
+        frames.clear();
+        spec.push(&mut buf, chunk, &mut frames);
+        for f in frames.drain(..) {
+            handle_frame(&state, f);
         }
     }
 }
 
-fn handle_line(state: &Arc<PortState>, bytes: Vec<u8>) {
+/// Block until `fd` is readable or `timeout` elapses. Returns true if
+/// readable (or on poll error — let `read` surface it), false on timeout.
+fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    // SAFETY: fd is owned by the reader's `File` for the loop's lifetime.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let pt = PollTimeout::try_from(ms).unwrap_or(PollTimeout::NONE);
+    !matches!(poll(&mut fds, pt), Ok(0))
+}
+
+fn handle_frame(state: &Arc<PortState>, bytes: Vec<u8>) {
     let scenario = state.active.read().unwrap().clone();
     let matched_rule = {
-        let mut master = state.master.lock().unwrap();
-        match process_line_on(&scenario, &bytes, &mut *master) {
+        let mut writer = state.writer.lock().unwrap();
+        match process_line_on(&scenario, &bytes, &mut *writer) {
             Ok((label, _resp)) => label,
             Err((label, err)) => {
                 warn!(
                     port = %state.name,
                     rule = %label,
                     error = %err,
-                    "input-rule write to master failed",
+                    "input-rule write to transport failed",
                 );
                 Some(label)
             }
@@ -441,6 +477,7 @@ mod tests {
                     match_: MatchConfig {
                         exact: Some("Q\r\n".into()),
                         regex: None,
+                        mask: None,
                     },
                     response: "S S  12.50 kg\r\n".into(),
                 },
@@ -448,6 +485,7 @@ mod tests {
                     match_: MatchConfig {
                         exact: None,
                         regex: Some(r"^GET .*\r?\n$".into()),
+                        mask: None,
                     },
                     response: "OK\r\n".into(),
                 },
@@ -583,6 +621,8 @@ mod tests {
             name: "p".into(),
             initial_scenario: "idle".into(),
             symlink: None,
+            transport: Default::default(),
+            framing: None,
             capture: Default::default(),
             scenarios: vec![
                 ScenarioConfig {

@@ -363,6 +363,59 @@ fn raw_capture_returns_received_bytes() {
     assert!(found, "raw capture did not contain the bytes we sent");
 }
 
+// A binary device: length-prefixed framing, hex matches and responses.
+// Frame layout: [STX=0x02][LEN:1][payload(LEN bytes)], LEN counts payload.
+const BINARY_CONFIG: &str = r#"
+http:
+  bind: "127.0.0.1:__PORT__"
+
+ports:
+  - name: sensor-1
+    initial_scenario: idle
+    framing:
+      type: length_prefixed
+      header_size: 2
+      length_offset: 1
+      length_size: 1
+      length_includes: payload
+    scenarios:
+      - name: idle
+        input_rules:
+          # Full frame STX 03 'Q' 'U' 'E' -> ACK then a binary reading.
+          - match: { exact: { hex: "02 03 51 55 45" } }
+            response: { hex: "06 02 99 7F" }
+          # Masked match: STX, any length byte, then 'P' 'I' 'N'.
+          - match: { mask: { pattern: { hex: "02 00 50 49 4E" },
+                             mask:    { hex: "FF 00 FF FF FF" } } }
+            response: { base64: "Bg==" }
+"#;
+
+#[test]
+fn binary_length_prefixed_exact_match_responds() {
+    let svc = Service::spawn(BINARY_CONFIG);
+    let mut slave = open_slave_raw(&svc.pty_paths[0]);
+
+    // Send the framed request split across two writes to exercise the
+    // cross-chunk framer buffering.
+    slave.write_all(&[0x02, 0x03, b'Q']).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    slave.write_all(b"UE").unwrap();
+
+    let bytes = read_with_timeout(&mut slave, 4, Duration::from_secs(2));
+    assert_eq!(bytes, vec![0x06, 0x02, 0x99, 0x7F]);
+}
+
+#[test]
+fn binary_mask_match_responds() {
+    let svc = Service::spawn(BINARY_CONFIG);
+    let mut slave = open_slave_raw(&svc.pty_paths[0]);
+
+    // LEN byte (0x03) is a don't-care under the mask.
+    slave.write_all(&[0x02, 0x03, b'P', b'I', b'N']).unwrap();
+    let bytes = read_with_timeout(&mut slave, 1, Duration::from_secs(2));
+    assert_eq!(bytes, vec![0x06]);
+}
+
 fn poll_events(svc: &Service, expected_count: usize, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last = String::new();

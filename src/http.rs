@@ -352,7 +352,7 @@ fn port_summary_json(state: &Arc<PortState>) -> String {
     format!(
         "{{\"name\":\"{}\",\"pty_path\":\"{}\",\"active_scenario\":\"{}\",\"scenarios\":[{}]}}",
         json_escape(&state.name),
-        json_escape(&state.pty_path.display().to_string()),
+        json_escape(&state.device_path_str()),
         json_escape(&active),
         scenarios
     )
@@ -379,7 +379,7 @@ fn port_detail_json(state: &Arc<PortState>) -> String {
     format!(
         "{{\"name\":\"{}\",\"pty_path\":\"{}\",\"active_scenario\":\"{}\",\"scenarios\":[{}],\"triggers\":[{}],\"input_rule_count\":{}}}",
         json_escape(&state.name),
-        json_escape(&state.pty_path.display().to_string()),
+        json_escape(&state.device_path_str()),
         json_escape(&scenario.name),
         scenarios,
         triggers,
