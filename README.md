@@ -10,10 +10,54 @@ Configurable mock for serial-attached scales (and similar line-oriented devices)
 
 ## Install
 
+### Download a prebuilt binary (recommended)
+
+Prebuilt binaries are on the [releases page](https://github.com/jochen42/serial-mock-service/releases) for macOS and Linux, on both `x86_64` and `arm64`.
+
+Auto-detect the platform and install the latest release to `/usr/local/bin`:
+
+```sh
+VERSION=v0.2.0   # latest tag from the releases page
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  TARGET=aarch64-apple-darwin ;;
+  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
+  Linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;
+  Linux-x86_64)  TARGET=x86_64-unknown-linux-gnu ;;
+  *) echo "unsupported platform"; exit 1 ;;
+esac
+
+BASE=https://github.com/jochen42/serial-mock-service/releases/download/$VERSION
+ARCHIVE=serial-mock-service-$VERSION-$TARGET.tar.gz
+
+curl -fsSL -O "$BASE/$ARCHIVE"
+curl -fsSL -O "$BASE/$ARCHIVE.sha256"
+shasum -a 256 -c "$ARCHIVE.sha256"   # Linux: sha256sum -c "$ARCHIVE.sha256"
+tar xzf "$ARCHIVE"                    # extracts ./serial-mock-service
+sudo install serial-mock-service /usr/local/bin/
+```
+
+The binary is unsigned. On macOS, if Gatekeeper blocks it, clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/serial-mock-service
+```
+
+### Build from source
+
+Requires a Rust toolchain.
+
 ```sh
 cargo build --release
-./target/release/serial-mock-service serve path/to/config.yaml
+sudo install target/release/serial-mock-service /usr/local/bin/   # optional
 ```
+
+### Run
+
+```sh
+serial-mock-service serve path/to/config.yaml
+```
+
+(From a source build without installing: `./target/release/serial-mock-service serve …`.)
 
 On startup the service prints one line per configured port:
 
