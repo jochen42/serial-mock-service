@@ -36,6 +36,20 @@ ports:
           - match: { exact: "Q\r\n" }
             response: "ERR\r\n"
 
+  - name: scale-2
+    initial_scenario: idle
+    symlink: /tmp/tty.mock-scale-2
+    capture:
+      max_events: 1000
+      max_raw_bytes: 65536
+    scenarios:
+      - name: idle
+        triggers:
+          - name: print
+            response: "Date: 01/01/2000\r\nTime: 53:@5:85pm\r\nNet        70 lb\r\nTare      155 lb\r\nGross     225 lb\r\n\r\n\r\n"
+          - name: print-no-tare
+            response: "Date: 01/01/2000\r\nTime: 53:@5:85pm\r\nGross     225 lb\r\n\r\n\r\n"
+
   # Shimadzu MOC63u moisture analyzer. Print-only device: it emits a
   # multi-line report at the printer port when a measurement finishes.
   # No input/ping is supported, so there are no input_rules — the
